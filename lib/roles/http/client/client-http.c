@@ -993,6 +993,27 @@ lws_client_interpret_server_handshake(struct lws *wsi)
 		lwsl_info("%s: %s: client conn up\n", __func__, lws_wsi_tag(wsi));
 
 		/*
+		 * Did we get a Digest authorization request ?
+		 */
+		if(n == 401 && lws_hdr_fragment_length(wsi,WSI_TOKEN_HTTP_WWW_AUTHENTICATE,0) > 0 ){
+	        p = lws_generate_client_handshake(wsi, p);
+
+
+	        if (p == NULL) {
+	            if (wsi->role_ops == &role_ops_raw_skt
+#if defined(LWS_ROLE_RAW_FILE)
+	                || wsi->role_ops == &role_ops_raw_file
+#endif
+	                )
+	                return 0;
+
+	            lwsl_err("Failed to generate handshake for client\n");
+	            lws_close_free_wsi(wsi, LWS_CLOSE_STATUS_NOSTATUS,
+	                       "chs");
+	            return -1;
+	        }
+		}
+		/*
 		 * Did we get a response from the server with an explicit
 		 * content-length of zero?  If so, and it's not H2 which will
 		 * notice it via END_STREAM, this transaction is already

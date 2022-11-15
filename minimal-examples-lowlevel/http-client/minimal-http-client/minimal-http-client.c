@@ -13,9 +13,12 @@
  */
 
 #include <libwebsockets.h>
+#include <openssl/rand.h>
 #include <string.h>
 #include <signal.h>
-
+#include <stdbool.h>
+#include <openssl/md5.h>
+#include <stdint.h>
 static int interrupted, bad = 1, status, conmon, close_after_start;
 #if defined(LWS_WITH_HTTP2)
 static int long_poll;
@@ -67,11 +70,647 @@ static const char *ua = "Mozilla/5.0 (X11; Linux x86_64) "
 			"Chrome/51.0.2704.103 Safari/537.36",
 		  *acc = "*/*";
 
+#define SESSION_ALGO 1 /* for algos with this bit set */
+
+#define ALGO_MD5 0
+#define ALGO_MD5SESS (ALGO_MD5 | SESSION_ALGO)
+#define ALGO_SHA256 2
+#define ALGO_SHA256SESS (ALGO_SHA256 | SESSION_ALGO)
+#define ALGO_SHA512_256 4
+#define ALGO_SHA512_256SESS (ALGO_SHA512_256 | SESSION_ALGO)
+#define DIGEST_MAX_VALUE_LENGTH           256
+#define DIGEST_MAX_CONTENT_LENGTH         1024
+#define DIGEST_QOP_VALUE_STRING_AUTH      "auth"
+#define DIGEST_QOP_VALUE_STRING_AUTH_INT  "auth-int"
+#define DIGEST_QOP_VALUE_STRING_AUTH_CONF "auth-conf"
+#define ISBLANK(x)  (((x) == ' ') || ((x) == '\t'))
+
+/* Struct used for Digest challenge-response authentication from libcurl*/
+struct digestdata {
+  char *nonce;
+  char *cnonce;
+  char *realm;
+  char *opaque;
+  char *qop;
+  char *algorithm;
+  int nc; /* nonce count */
+  unsigned char algo;
+  bool stale; /* set true for re-negotiation */
+  bool userhash;
+};
+
+bool Curl_auth_digest_get_pair(const char *str, char *value, char *content,
+                               const char **endptr)
+{
+  int c;
+  bool starts_with_quote = false;
+  bool escape = false;
+
+  for(c = DIGEST_MAX_VALUE_LENGTH - 1; (*str && (*str != '=') && c--);)
+    *value++ = *str++;
+  *value = 0;
+
+  if('=' != *str++)
+    /* eek, no match */
+    return false;
+
+  if('\"' == *str) {
+    /* This starts with a quote so it must end with one as well! */
+    str++;
+    starts_with_quote = true;
+  }
+
+  for(c = DIGEST_MAX_CONTENT_LENGTH - 1; *str && c--; str++) {
+    if(!escape) {
+      switch(*str) {
+      case '\\':
+        if(starts_with_quote) {
+          /* the start of an escaped quote */
+          escape = true;
+          continue;
+        }
+        break;
+
+      case ',':
+        if(!starts_with_quote) {
+          /* This signals the end of the content if we didn't get a starting
+             quote and then we do "sloppy" parsing */
+          c = 0; /* the end */
+          continue;
+        }
+        break;
+
+      case '\r':
+      case '\n':
+        /* end of string */
+        if(starts_with_quote)
+          return false; /* No closing quote */
+        c = 0;
+        continue;
+
+      case '\"':
+        if(starts_with_quote) {
+          /* end of string */
+          c = 0;
+          continue;
+        }
+        else
+          return false;
+        break;
+      }
+    }
+
+    escape = false;
+    *content++ = *str;
+  }
+  if(escape)
+    return false; /* No character after backslash */
+
+  *content = 0;
+  *endptr = str;
+
+  return true;
+}
+
+/*
+ * Curl_auth_digest_cleanup()
+ *
+ * This is used to clean up the digest specific data.
+ *
+ * Parameters:
+ *
+ * digest    [in/out] - The digest data struct being cleaned up.
+ *
+ */
+void Curl_auth_digest_cleanup(struct digestdata *digest)
+{
+  if(digest->nonce)
+    free(digest->nonce);
+  if(digest->cnonce)
+    free(digest->cnonce);
+  if(digest->realm)
+    free(digest->realm);
+  if(digest->opaque)
+    free(digest->opaque);
+  if(digest->qop)
+    free(digest->qop);
+  if(digest->algorithm)
+    free(digest->algorithm);
+
+  digest->nc = 0;
+  digest->algo = ALGO_MD5; /* default algorithm */
+  digest->stale = false; /* default means normal, not stale */
+  digest->userhash = false;
+}
+
+/*
+ * Curl_auth_decode_digest_http_message()
+ *
+ * This is used to decode an HTTP DIGEST challenge message into the separate
+ * attributes.
+ *
+ * Parameters:
+ *
+ * chlg    [in]     - The challenge message.
+ * digest  [in/out] - The digest data struct being used and modified.
+ *
+ * Returns CURLE_OK on success.
+ */
+int auth_decode_digest_http_message(const char *chlg,
+                                              struct digestdata *digest)
+{
+  bool before = false; /* got a nonce before */
+  bool foundAuth = false;
+  bool foundAuthInt = false;
+  char *token = NULL;
+  char *tmp = NULL;
+
+  /* If we already have received a nonce, keep that in mind */
+  if(digest->nonce)
+    before = true;
+
+  /* Clean up any former leftovers and initialise to defaults */
+  Curl_auth_digest_cleanup(digest);
+
+  for(;;) {
+    char value[DIGEST_MAX_VALUE_LENGTH];
+    char content[DIGEST_MAX_CONTENT_LENGTH];
+
+    /* Pass all additional spaces here */
+    while(*chlg && ISBLANK(*chlg))
+      chlg++;
+
+    /* Extract a value=content pair */
+    if(Curl_auth_digest_get_pair(chlg, value, content, &chlg)) {
+      if(strcasecmp(value, "nonce") == 0) {
+        free(digest->nonce);
+        digest->nonce = strdup(content);
+        if(!digest->nonce)
+          return -1;
+      }
+      else if(strcasecmp(value, "stale") == 0) {
+        if(strcasecmp(content, "true") == 0) {
+          digest->stale = true;
+          digest->nc = 1; /* we make a new nonce now */
+        }
+      }
+      else if(strcasecmp(value, "realm") == 0) {
+        free(digest->realm);
+        digest->realm = strdup(content);
+        if(!digest->realm)
+          return -1;
+      }
+      else if(strcasecmp(value, "opaque") == 0) {
+        free(digest->opaque);
+        digest->opaque = strdup(content);
+        if(!digest->opaque)
+          return -1;
+      }
+      else if(strcasecmp(value, "qop") == 0) {
+        char *tok_buf = NULL;
+        /* Tokenize the list and choose auth if possible, use a temporary
+           clone of the buffer since strtok_r() ruins it */
+        tmp = strdup(content);
+        if(!tmp)
+          return -1;
+
+        token = strtok_r(tmp, ",", &tok_buf);
+        while(token) {
+          /* Pass additional spaces here */
+          while(*token && ISBLANK(*token))
+            token++;
+          if(strcasecmp(token, DIGEST_QOP_VALUE_STRING_AUTH) == 0) {
+            foundAuth = true;
+          }
+          else if(strcasecmp(token, DIGEST_QOP_VALUE_STRING_AUTH_INT) == 0) {
+            foundAuthInt = true;
+          }
+          token = strtok_r(NULL, ",", &tok_buf);
+        }
+
+        free(tmp);
+
+        /* Select only auth or auth-int. Otherwise, ignore */
+        if(foundAuth) {
+          if(digest->qop)
+            free(digest->qop);
+          digest->qop = strdup(DIGEST_QOP_VALUE_STRING_AUTH);
+          if(!digest->qop)
+            return -1;
+        }
+        else if(foundAuthInt) {
+          free(digest->qop);
+          digest->qop = strdup(DIGEST_QOP_VALUE_STRING_AUTH_INT);
+          if(!digest->qop)
+            return -1;
+        }
+      }
+      else if(strcasecmp(value, "algorithm") == 0) {
+        free(digest->algorithm);
+        digest->algorithm = strdup(content);
+        if(!digest->algorithm)
+          return -1;
+
+        if(strcasecmp(content, "MD5-sess") == 0)
+          digest->algo = ALGO_MD5SESS;
+        else if(strcasecmp(content, "MD5") == 0)
+          digest->algo = ALGO_MD5;
+        else if(strcasecmp(content, "SHA-256") == 0)
+          digest->algo = ALGO_SHA256;
+        else if(strcasecmp(content, "SHA-256-SESS") == 0)
+          digest->algo = ALGO_SHA256SESS;
+        else if(strcasecmp(content, "SHA-512-256") == 0)
+          digest->algo = ALGO_SHA512_256;
+        else if(strcasecmp(content, "SHA-512-256-SESS") == 0)
+          digest->algo = ALGO_SHA512_256SESS;
+        else
+          return -1;
+      }
+      else if(strcasecmp(value, "userhash") == 0) {
+        if(strcasecmp(content, "true") == 0) {
+          digest->userhash = true;
+        }
+      }
+      else {
+        /* Unknown specifier, ignore it! */
+      }
+    }
+    else
+      break; /* We're done here */
+
+    /* Pass all additional spaces here */
+    while(*chlg && ISBLANK(*chlg))
+      chlg++;
+
+    /* Allow the list to be comma-separated */
+    if(',' == *chlg)
+      chlg++;
+  }
+
+  /* We had a nonce since before, and we got another one now without
+     'stale=true'. This means we provided bad credentials in the previous
+     request */
+  if(before && !digest->stale)
+    return -1;
+
+  /* We got this header without a nonce, that's a bad Digest line! */
+  if(!digest->nonce)
+    return -1;
+
+  /* "<algo>-sess" protocol versions require "auth" or "auth-int" qop */
+  if(!digest->qop && (digest->algo & SESSION_ALGO))
+    return -1;
+
+  return 0;
+}
+
+int md5_hash(uint8_t *output, uint8_t* input, size_t len){
+  MD5_CTX ctx;
+  int result =MD5_Init(&ctx);
+  if(!result) {
+    MD5_Update(&ctx, input, len);
+    MD5_Final(output, &ctx);
+  }
+  return result;
+}
+/* Convert md5 chunk to RFC2617 (section 3.1.3) -suitable ascii string */
+static void convert_to_ascii(unsigned char *source, /* 16 bytes */
+                                     unsigned char *dest) /* 33 bytes */
+{
+  int i;
+  for(i = 0; i < 16; i++)
+    snprintf((char *) &dest[i * 2], 3, "%02x", source[i]);
+}
+/* Perform quoted-string escaping as described in RFC2616 and its errata */
+static char *auth_digest_string_quoted(const char *source)
+{
+  char *dest;
+  const char *s = source;
+  size_t n = 1; /* null terminator */
+
+  /* Calculate size needed */
+  while(*s) {
+    ++n;
+    if(*s == '"' || *s == '\\') {
+      ++n;
+    }
+    ++s;
+  }
+
+  dest = malloc(n);
+  if(dest) {
+    char *d = dest;
+    s = source;
+    while(*s) {
+      if(*s == '"' || *s == '\\') {
+        *d++ = '\\';
+      }
+      *d++ = *s++;
+    }
+    *d = '\0';
+  }
+
+  return dest;
+}
+int output_digest(struct lws *wsi, char *http_req,  char *uri, char *user, char *password, char *challenge,
+    char **outptr, size_t *outlen
+    )
+{
+  //printf("Calculate Digest response for path %s, user %s password %s and challenge %s\r\n",uri,user,password,challenge);
+
+  unsigned char hashbuf[32]; /* 32 bytes/256 bits */
+  unsigned char request_digest[65];
+  unsigned char ha1[65];    /* 64 digits and 1 zero byte */
+  unsigned char ha2[65];    /* 64 digits and 1 zero byte */
+  char userh[65];
+  char cnonce[65];
+  char *userp_quoted;
+  char *realm_quoted;
+  char *nonce_quoted;
+  char *response = NULL;
+  char *hashthis = NULL;
+  char *tmp = NULL;
+  struct digestdata digest;
+  char *ch = challenge;
+  char cnoncebuf[33] = {0x0};
+
+  ch += strlen("Digest ");
+
+  digest.algorithm = NULL;
+  digest.nonce = NULL;
+  digest.cnonce = NULL;
+  digest.opaque = NULL;
+  digest.realm = NULL;
+  digest.qop = NULL;
+
+  if(auth_decode_digest_http_message(ch, &digest) != 0){
+    printf("Digest decode error\r\n");
+    return -1;
+  }
+
+  digest.nc = 1;
+  memset(hashbuf,0x0,32);
+  memset(cnoncebuf,0x0,33);
+
+  lws_get_random(lws_get_context(wsi), cnoncebuf, sizeof(cnoncebuf));
+
+  lws_b64_encode_string(cnoncebuf, (int)strlen(cnoncebuf), cnonce, 64);
+
+  digest.cnonce = cnonce;
+
+  if(digest.userhash)
+  {
+    hashthis = malloc(sizeof(char) * (strlen(user) + strlen(digest.realm) +2)  );
+    sprintf(hashthis, "%s:%s", user, digest.realm ? digest.realm : "");
+    if(!hashthis)
+      return -1;
+
+    md5_hash(hashbuf, (uint8_t *)hashthis, strlen(hashthis));
+    free(hashthis);
+    convert_to_ascii(hashbuf, (unsigned char*)userh);
+  }
+
+  /*
+    If the algorithm is "MD5" or unspecified (which then defaults to MD5):
+
+      A1 = unq(username-value) ":" unq(realm-value) ":" passwd
+
+    If the algorithm is "MD5-sess" then:
+
+      A1 = H(unq(username-value) ":" unq(realm-value) ":" passwd) ":"
+           unq(nonce-value) ":" unq(cnonce-value)
+  */
+
+  hashthis = malloc(sizeof(char) * (strlen(user) + strlen(password) + strlen(digest.realm) +3)  );
+  sprintf(hashthis,"%s:%s:%s", user, digest.realm ? digest.realm : "",
+      password);
+  if(!hashthis)
+    return -1;
+
+
+
+  md5_hash(hashbuf, (uint8_t *)hashthis, strlen(hashthis));
+  free(hashthis);
+  convert_to_ascii(hashbuf, ha1);
+  tmp = malloc(sizeof(char) *(strlen((char *)ha1)+1+strlen(digest.nonce)+1+strlen(digest.cnonce)+1));
+  if(digest.algo & SESSION_ALGO) {
+    /* nonce and cnonce are OUTSIDE the hash */
+    sprintf(tmp,"%s:%s:%s", ha1, digest.nonce, digest.cnonce);
+    if(!tmp)
+      return -1;
+
+    md5_hash(hashbuf, (unsigned char *) tmp, strlen(tmp));
+    free(tmp);
+    convert_to_ascii(hashbuf, ha1);
+  }
+
+  /*
+    If the "qop" directive's value is "auth" or is unspecified, then A2 is:
+
+      A2 = Method ":" digest-uri-value
+
+    If the "qop" value is "auth-int", then A2 is:
+
+      A2 = Method ":" digest-uri-value ":" H(entity-body)
+
+    (The "Method" value is the HTTP request method as specified in section
+    5.1.1 of RFC 2616)
+  */
+  hashthis = malloc(sizeof(char) * (strlen(http_req) + strlen(uri) +2)  );
+  sprintf(hashthis,"%s:%s", http_req, uri);
+  if(!hashthis)
+    return -1;
+
+  if(digest.qop && strcasecmp(digest.qop, "auth-int") == 0) {
+    /* We don't support auth-int for PUT or POST */
+    char hashed[65];
+    char *hashthis2;
+
+    md5_hash(hashbuf, (uint8_t*)"", 0);
+    convert_to_ascii(hashbuf, (unsigned char *)hashed);
+    hashthis2 = malloc(sizeof(char) * (strlen(hashthis) + strlen(hashed) +2)  );
+    sprintf(hashthis2, "%s:%s", hashthis, hashed);
+    free(hashthis);
+    hashthis = hashthis2;
+  }
+
+  if(!hashthis)
+    return -1;
+
+  md5_hash(hashbuf, (unsigned char *) hashthis, strlen(hashthis));
+  free(hashthis);
+  convert_to_ascii(hashbuf, ha2);
+
+  if(digest.qop) {
+    hashthis = malloc(sizeof(char) * (strlen((char *)ha1) + 1 +
+                                      strlen(digest.nonce) + 1 +
+                                      8 + 1 +
+                                      strlen(digest.cnonce) + 1 +
+                                      strlen(digest.qop) + 1) +
+                                      strlen((char *)ha2) + 1);
+    sprintf(hashthis,"%s:%s:%08x:%s:%s:%s", ha1, digest.nonce, digest.nc,
+                       digest.cnonce, digest.qop, ha2);
+  }
+  else {
+    hashthis = malloc(sizeof(char) * (strlen((char *)ha1) + 1 +
+                                      strlen(digest.nonce) + 1 +
+                                      strlen((char *)ha2) + 1));
+    sprintf(hashthis,"%s:%s:%s", ha1, digest.nonce, ha2);
+  }
+
+  if(!hashthis)
+    return -1;
+
+  md5_hash(hashbuf, (unsigned char *) hashthis, strlen(hashthis));
+  free(hashthis);
+  convert_to_ascii(hashbuf, request_digest);
+
+  /* For test case 64 (snooped from a Mozilla 1.3a request)
+
+     Authorization: Digest username="testuser", realm="testrealm", \
+     nonce="1053604145", uri="/64", response="c55f7f30d83d774a3d2dcacf725abaca"
+
+     Digest parameters are all quoted strings.  Username which is provided by
+     the user will need double quotes and backslashes within it escaped.
+     realm, nonce, and opaque will need backslashes as well as they were
+     de-escaped when copied from request header.  cnonce is generated with
+     web-safe characters.  uri is already percent encoded.  nc is 8 hex
+     characters.  algorithm and qop with standard values only contain web-safe
+     characters.
+  */
+  userp_quoted = auth_digest_string_quoted(digest.userhash ? userh : user);
+  if(!userp_quoted)
+    return -1;
+  if(digest.realm)
+    realm_quoted = auth_digest_string_quoted(digest.realm);
+  else {
+    realm_quoted = malloc(1);
+    if(realm_quoted)
+      realm_quoted[0] = 0;
+  }
+  if(!realm_quoted) {
+    free(userp_quoted);
+    return -1;
+  }
+  nonce_quoted = auth_digest_string_quoted(digest.nonce);
+  if(!nonce_quoted) {
+    free(realm_quoted);
+    free(userp_quoted);
+    return -1;
+  }
+
+  if(digest.qop) {
+    response = malloc(sizeof(char) * (strlen(userp_quoted) + 1 +
+                                      strlen(realm_quoted) + 1 +
+                                      strlen(nonce_quoted) + 1 +
+                                      strlen(uri) + 1 +
+                                      strlen(digest.cnonce) + 1 +
+                                      8 + 1 +
+                                      strlen(digest.qop) + 1 +
+                                      strlen((char *)request_digest) + 1 +
+                                      256));
+    sprintf(response, "Digest username=\"%s\", "
+                       "realm=\"%s\", "
+                       "nonce=\"%s\", "
+                       "uri=\"%s\", "
+                       "cnonce=\"%s\", "
+                       "nc=%08x, "
+                       "qop=%s, "
+                       "response=\"%s\"",
+                       userp_quoted,
+                       realm_quoted,
+                       nonce_quoted,
+                       uri,
+                       digest.cnonce,
+                       digest.nc,
+                       digest.qop,
+                       request_digest);
+
+    /* Increment nonce-count to use another nc value for the next request */
+    digest.nc++;
+  }
+  else {
+    response = malloc(sizeof(char) * (strlen(userp_quoted) + 1 +
+                                      strlen(realm_quoted) + 1 +
+                                      strlen(nonce_quoted) + 1 +
+                                      strlen(uri) + 1 +
+                                      strlen((char *)request_digest) + 1 +
+                                      128));
+    sprintf(response,"Digest username=\"%s\", "
+                       "realm=\"%s\", "
+                       "nonce=\"%s\", "
+                       "uri=\"%s\", "
+                       "response=\"%s\"",
+                       userp_quoted,
+                       realm_quoted,
+                       nonce_quoted,
+                       uri,
+                       request_digest);
+  }
+  free(nonce_quoted);
+  free(realm_quoted);
+  free(userp_quoted);
+  if(!response)
+    return -1;
+
+  /* Add the optional fields */
+  if(digest.opaque) {
+    char *opaque_quoted;
+    /* Append the opaque */
+    opaque_quoted = auth_digest_string_quoted(digest.opaque);
+    if(!opaque_quoted) {
+      free(response);
+      return -1;
+    }
+    tmp = malloc(sizeof(char)*strlen(response)+strlen(opaque_quoted)+16);
+    sprintf(tmp,"%s, opaque=\"%s\"", response, opaque_quoted);
+    free(response);
+    free(opaque_quoted);
+    if(!tmp)
+      return -1;
+
+    response = tmp;
+  }
+
+  if(digest.algorithm) {
+    /* Append the algorithm */
+    tmp = malloc(sizeof(char)*strlen(response)+strlen(digest.algorithm)+16);
+    sprintf(tmp,"%s, algorithm=%s", response, digest.algorithm);
+    free(response);
+    if(!tmp)
+      return -1;
+
+    response = tmp;
+  }
+
+  if(digest.userhash) {
+    /* Append the userhash */
+    tmp = malloc(sizeof(char)*strlen(response)+16);
+    sprintf(tmp,"%s, userhash=true", response);
+    free(response);
+    if(!tmp)
+      return -1;
+
+    response = tmp;
+  }
+
+  /* Return the output */
+  *outptr = response;
+  *outlen = strlen(response);
+
+  return 0;
+
+}
+char *www_authenticate_buffer = NULL;
+int auth_type = 0;
+char path[512] ;
 static int
 callback_http(struct lws *wsi, enum lws_callback_reasons reason,
 	      void *user, void *in, size_t len)
 {
-	switch (reason) {
+
+    printf("callback call reason %d status %d\r\n",reason,status );
+    switch (reason) {
 
 	/* because we are protocols[0] ... */
 	case LWS_CALLBACK_CLIENT_CONNECTION_ERROR:
@@ -111,35 +750,68 @@ callback_http(struct lws *wsi, enum lws_callback_reasons reason,
 		if (lws_fi_user_wsi_fi(wsi, "user_reject_at_est"))
 			return -1;
 
-		break;
-
-	/* you only need this if you need to do Basic Auth */
-	case LWS_CALLBACK_CLIENT_APPEND_HANDSHAKE_HEADER:
-	{
-		unsigned char **p = (unsigned char **)in, *end = (*p) + len;
-
-		if (lws_add_http_header_by_token(wsi, WSI_TOKEN_HTTP_USER_AGENT,
-				(unsigned char *)ua, (int)strlen(ua), p, end))
-			return -1;
-
-		if (lws_add_http_header_by_token(wsi, WSI_TOKEN_HTTP_ACCEPT,
-				(unsigned char *)acc, (int)strlen(acc), p, end))
-			return -1;
-#if defined(LWS_WITH_HTTP_BASIC_AUTH)
-		{
-		char b[128];
-
-		if (!ba_user || !ba_password)
-			break;
-
-		if (lws_http_basic_auth_gen(ba_user, ba_password, b, sizeof(b)))
-			break;
-		if (lws_add_http_header_by_token(wsi, WSI_TOKEN_HTTP_AUTHORIZATION,
-				(unsigned char *)b, (int)strlen(b), p, end))
-			return -1;
+		if(lws_hdr_total_length(wsi, WSI_TOKEN_HTTP_WWW_AUTHENTICATE) > 0){
+	        www_authenticate_buffer = malloc((size_t) lws_hdr_total_length(wsi, WSI_TOKEN_HTTP_WWW_AUTHENTICATE) +1);
+	        memset(www_authenticate_buffer,0x0,(size_t)lws_hdr_total_length(wsi, WSI_TOKEN_HTTP_WWW_AUTHENTICATE) +1);
+	        lws_hdr_copy(wsi,www_authenticate_buffer,1024,WSI_TOKEN_HTTP_WWW_AUTHENTICATE);
+	        if(strncmp(www_authenticate_buffer,"Digest",5) == 0){
+	          auth_type = 2;
+	        }else if(strncmp(www_authenticate_buffer,"Basic",5) == 0){
+	          auth_type = 1;
+	        }
 		}
+#if 0
+        int i = 0;
+        for(i = 0;i<WSI_TOKEN_COUNT;i++){
+          char buffer[1024];
+          memset(buffer,0x0,1024);
+          lws_hdr_copy(wsi,buffer,1024,i);
+          printf("header %d %s\r\n",i,buffer);
+        }
 #endif
 		break;
+        /* you only need this if you need to do Basic Auth */
+        case LWS_CALLBACK_CLIENT_APPEND_HANDSHAKE_HEADER:
+	    {
+	        unsigned char **p = (unsigned char **)in, *end = (*p) + len;
+
+	        if (lws_add_http_header_by_token(wsi, WSI_TOKEN_HTTP_USER_AGENT,
+	                (unsigned char *)ua, (int)strlen(ua), p, end))
+	            return -1;
+
+	        if (lws_add_http_header_by_token(wsi, WSI_TOKEN_HTTP_ACCEPT,
+	                (unsigned char *)acc, (int)strlen(acc), p, end))
+	            return -1;
+#if defined(LWS_WITH_HTTP_BASIC_AUTH)
+	        if(www_authenticate_buffer == NULL){
+
+
+              char b[128];
+
+              if (!ba_user || !ba_password)
+                  break;
+
+              if (lws_http_basic_auth_gen(ba_user, ba_password, b, sizeof(b)))
+                  break;
+              if (lws_add_http_header_by_token(wsi, WSI_TOKEN_HTTP_AUTHORIZATION,
+                      (unsigned char *)b, (int)strlen(b), p, end))
+                  return -1;
+	        }else{
+	          if(auth_type == 2){
+	            printf("< WWW-Authenticate: %s\r\n",www_authenticate_buffer);
+	            char *output = NULL;
+	            size_t output_size = 0;
+
+	            output_digest(wsi,"GET", path, (char *)ba_user, (char *)ba_password, www_authenticate_buffer, &output,&output_size);
+	            printf("> Authorization: %s\r\n",output);
+	            if (lws_add_http_header_by_token(wsi, WSI_TOKEN_HTTP_AUTHORIZATION,
+	                      (unsigned char *)output, (int)output_size, p, end))
+	                  return -1;
+	            }
+	          }
+
+#endif
+	        break;
 	}
 
 	/* chunks of chunked content, with header removed */
@@ -196,6 +868,7 @@ callback_http(struct lws *wsi, enum lws_callback_reasons reason,
 		break;
 	}
 
+    printf("lws_callback_http_dummy reason %d in %p len %lu\r\n",reason,in,len);
 	return lws_callback_http_dummy(wsi, reason, user, in, len);
 }
 
@@ -318,7 +991,8 @@ system_notify_cb(lws_state_manager_t *mgr, lws_state_notify_link_t *link,
 		i.path = p;
 	else
 		i.path = "/";
-
+	memset(path,0x0,512);
+	strncpy(path,i.path,512);
 	i.host = i.address;
 	i.origin = i.address;
 	i.method = "GET";
