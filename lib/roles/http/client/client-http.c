@@ -1,7 +1,7 @@
 /*
  * libwebsockets - small server side websockets and web server implementation
  *
- * Copyright (C) 2010 - 2020 Andy Green <andy@warmcat.com>
+ * Copyright (C) 2010 - 2023 Andy Green <andy@warmcat.com>
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to
@@ -580,7 +580,7 @@ lws_http_client_http_response(struct lws *wsi)
 #endif
 
 
-#if defined(LWS_WITH_HTTP_DIGEST_AUTH)
+#if defined(LWS_WITH_HTTP_DIGEST_AUTH) && defined(LWS_WITH_TLS)
 
 static const char *digest_toks[] = {
 	"Digest",	// 1 <<  0
@@ -591,7 +591,7 @@ static const char *digest_toks[] = {
 	"response",	// 1 <<  5
 	"opaque",	// 1 <<  6
 	"qop",		// 1 <<  7
-	"algorithm"	// 1 <<  8
+	"algorithm",	// 1 <<  8
 	"nc",		// 1 <<  9
 	"cnonce",	// 1 << 10
 	"domain",	// 1 << 11
@@ -603,8 +603,9 @@ static const char *digest_toks[] = {
 enum lws_check_basic_auth_results
 lws_http_digest_auth(struct lws* wsi)
 {
-	uint8_t nonce[128], response[LWS_GENHASH_LARGEST], qop[32];
-	int seen = 0, n, pend = -1, skipping = 0;
+	uint8_t nonce[256], response[LWS_GENHASH_LARGEST], qop[32];
+	int seen = 0, n, pend = -1;
+	char *tmp_digest = NULL;
 	struct lws_tokenize ts;
 	char resp_username[32];
 	lws_tokenize_elem e;
@@ -644,11 +645,9 @@ lws_http_digest_auth(struct lws* wsi)
 	 *
 	 * but the order, whitespace etc is quite open.  uri is optional
 	 */
-
-	ts.start = b64;
-	ts.len = (size_t)m;
-	ts.flags = LWS_TOKENIZE_F_MINUS_NONTERM | LWS_TOKENIZE_F_NO_INTEGERS |
-		   LWS_TOKENIZE_F_RFC7230_DELIMS;
+	lws_tokenize_init(&ts,b64, LWS_TOKENIZE_F_MINUS_NONTERM |
+				   LWS_TOKENIZE_F_NO_INTEGERS |
+				   LWS_TOKENIZE_F_RFC7230_DELIMS);
 
 	do {
 		e = lws_tokenize(&ts);
@@ -657,7 +656,7 @@ lws_http_digest_auth(struct lws* wsi)
 			if (pend == 8) {
 				/* algorithm name */
 
-				if (strncasecmp(ts.token, "MD5", ts.token_len)) {
+				if (!strncasecmp(ts.token, "MD5", ts.token_len)) {
 					lwsl_wsi_err(wsi, "wrong alg %.*s\n",
 							(int)ts.token_len,
 							ts.token);
@@ -666,8 +665,7 @@ lws_http_digest_auth(struct lws* wsi)
 				pend = PEND_DELIM;
 				break;
 			}
-			if (strncasecmp(ts.token, "Digest", ts.token_len)) {
-				skipping = 1;
+			if (!strncasecmp(ts.token, "Digest", ts.token_len)) {
 				seen |= 1 << 0;
 				break;
 			}
@@ -679,9 +677,7 @@ lws_http_digest_auth(struct lws* wsi)
 			break;
 
 		case LWS_TOKZE_TOKEN_NAME_EQUALS:
-			if (skipping)
-				break;
-			if (!(seen & (1 << 15)) || pend != -1)
+			if ((seen & (1 << 15)) == (1 << 15) || pend != -1)
 				/* no auth type token or disordered */
 				return LCBA_END_TRANSACTION;
 
@@ -697,7 +693,7 @@ lws_http_digest_auth(struct lws* wsi)
 				return LCBA_END_TRANSACTION;
 			}
 
-			if (seen & (1 << n) || !(seen & (1 << 15)))
+			if (seen & (1 << n) || (seen & (1 << 15)) == (1 << 15))
 				/* dup or no auth type token */
 				return LCBA_END_TRANSACTION;
 
@@ -706,8 +702,6 @@ lws_http_digest_auth(struct lws* wsi)
 			break;
 
 		case LWS_TOKZE_QUOTED_STRING:
-			if (skipping)
-				break;
 			if (pend < 0)
 				return LCBA_END_TRANSACTION;
 
@@ -759,8 +753,6 @@ lws_http_digest_auth(struct lws* wsi)
 
 			case LWS_TOKZE_DELIMITER:
 				if (*ts.token == ',') {
-					if (skipping)
-						break;
 					if (pend != PEND_DELIM)
 						return LCBA_END_TRANSACTION;
 
@@ -768,11 +760,6 @@ lws_http_digest_auth(struct lws* wsi)
 					break;
 				}
 				if (*ts.token == ';') {
-					if (skipping) {
-						/* try again with this one */
-						skipping = 0;
-						break;
-					}
 					/* it's the end */
 					e = LWS_TOKZE_ENDED;
 					break;
@@ -789,12 +776,8 @@ lws_http_digest_auth(struct lws* wsi)
 
 	} while (e > 0);
 
-	if (e != LWS_TOKZE_ENDED)
-		return LCBA_END_TRANSACTION;
+	/* we got all the parts we care about? Realm + Nonce... */
 
-	/* we got all the parts we care about? */
-
-	// Realm, nonce
 	if ((seen & 0xc) != 0xc) {
 		lwsl_wsi_err(wsi,
 				"%s: Not all digest auth tokens found! "
@@ -806,7 +789,7 @@ lws_http_digest_auth(struct lws* wsi)
 
 	lwsl_wsi_info(wsi, "HTTP digest auth realm %s nonce %s\n", realm, nonce);
 
-	if (wsi->stash && wsi->stash->cis[CIS_METHOD] &&
+	if (wsi->stash &&
 	    wsi->stash->cis[CIS_PATH]) {
 		char *username =  wsi->stash->cis[CIS_USERNAME];
 		char *password = wsi->stash->cis[CIS_PASSWORD];
@@ -819,28 +802,26 @@ lws_http_digest_auth(struct lws* wsi)
 		int ncount = 1, ssl;
 		const char *a, *p;
 		struct lws *nwsi;
-		char cnonce[128];
+		char cnonce[256];
 		size_t l;
 
-		if (!wsi->http.digest_auth_hdr) {
-			l = sizeof(a1) + sizeof(a2) + sizeof(nonce) +
-			    (sizeof(ncount) *2) + sizeof(response) +
-			    sizeof(cnonce) + sizeof(qop) + strlen(uri) +
-			    strlen(username) + strlen(password) +
-			    strlen(realm) + 111;
+		l = sizeof(a1) + sizeof(a2) + sizeof(nonce) +
+			(sizeof(ncount) *2) + sizeof(response) +
+			sizeof(cnonce) + sizeof(qop) + strlen(uri) +
+			strlen(username) + strlen(password) +
+			strlen(realm) + 111;
 
-			wsi->http.digest_auth_hdr = lws_malloc(l, __func__);
-			if (!wsi->http.digest_auth_hdr)
-				return -1;
-		}
+		tmp_digest = lws_malloc(l, __func__);
+		if (!tmp_digest)
+			return LCBA_FAILED_AUTH;
 
-		n = lws_snprintf(wsi->http.digest_auth_hdr, l, "%s:%s:%s",
+		n = lws_snprintf(tmp_digest, l, "%s:%s:%s",
 				 username, realm, password);
 
 		if (lws_genhash_init(&hc, LWS_GENHASH_TYPE_MD5) ||
 				lws_genhash_update(&hc,
-						   wsi->http.digest_auth_hdr,
-								(size_t)n) ||
+						   tmp_digest,
+							(size_t)n) ||
 				lws_genhash_destroy(&hc, digest)) {
 			lws_genhash_destroy(&hc, NULL);
 
@@ -852,12 +833,18 @@ lws_http_digest_auth(struct lws* wsi)
 					a1, sizeof(a1));
 		lwsl_debug("A1: %s:%s:%s = %s\n", username, realm, password, a1);
 
-		n = lws_snprintf(wsi->http.digest_auth_hdr, l, "%s:%s",
-				wsi->stash->cis[CIS_METHOD], uri);
+		/*
+		 * In case of Websocket upgrade, method is NULL
+		 * we assume it is a GET
+		*/
+
+		n = lws_snprintf(tmp_digest, l, "%s:%s",
+				   wsi->stash->cis[CIS_METHOD] ?
+				   wsi->stash->cis[CIS_METHOD] : "GET", uri);
 
 		if (lws_genhash_init(&hc, LWS_GENHASH_TYPE_MD5) ||
 				     lws_genhash_update(&hc,
-						    wsi->http.digest_auth_hdr,
+						    tmp_digest,
 						    (size_t)n) ||
 				     lws_genhash_destroy(&hc, digest)) {
 			lws_genhash_destroy(&hc, NULL);
@@ -875,14 +862,14 @@ lws_http_digest_auth(struct lws* wsi)
 		lws_hex_from_byte_array((const uint8_t *)&ncount,
 					sizeof(ncount), nc, sizeof(nc));
 
-		n = lws_snprintf(wsi->http.digest_auth_hdr, l, "%s:%s:%08x:%s:%s:%s", a1,
+		n = lws_snprintf(tmp_digest, l, "%s:%s:%08x:%s:%s:%s", a1,
 				nonce, ncount, cnonce, qop, a2);
 
-		lwsl_wsi_debug(wsi, "digest response: %s\n", wsi->http.digest_auth_hdr);
+		lwsl_wsi_debug(wsi, "digest response: %s\n", tmp_digest);
 
 
 		if (lws_genhash_init(&hc, LWS_GENHASH_TYPE_MD5) ||
-				lws_genhash_update(&hc, wsi->http.digest_auth_hdr, (size_t)n) ||
+				lws_genhash_update(&hc, tmp_digest, (size_t)n) ||
 				lws_genhash_destroy(&hc, digest)) {
 			lws_genhash_destroy(&hc, NULL);
 			lwsl_wsi_err(wsi, "hash failed\n");
@@ -894,18 +881,18 @@ lws_http_digest_auth(struct lws* wsi)
 					(char *)response,
 					lws_genhash_size(LWS_GENHASH_TYPE_MD5) * 2 + 1);
 
-		n = lws_snprintf(wsi->http.digest_auth_hdr, l,
-				"Digest username=\"%s\", realm=\"%s\", "
-				"nonce=\"%s\", uri=\"%s\", qop=%s, nc=%08x, "
-				"cnonce=\"%s\", response=\"%s\", "
-				"algorithm=\"MD5\"",
-				username, realm, nonce, uri, qop, ncount,
-				cnonce, response);
+		n = lws_snprintf(tmp_digest, l,
+				 "Digest username=\"%s\", realm=\"%s\", "
+				 "nonce=\"%s\", uri=\"%s\", qop=%s, nc=%08x, "
+				 "cnonce=\"%s\", response=\"%s\", "
+				 "algorithm=\"MD5\"",
+				 username, realm, nonce, uri, qop, ncount,
+				 cnonce, response);
 
-		lwsl_hexdump(wsi->http.digest_auth_hdr, l);
+		lwsl_hexdump(tmp_digest, l);
 
 		if (lws_hdr_simple_create(wsi, WSI_TOKEN_HTTP_AUTHORIZATION,
-				wsi->http.digest_auth_hdr)) {
+								tmp_digest)) {
 			lwsl_wsi_err(wsi, "Failed to add Digest auth header");
 			goto bail;
 		}
@@ -928,16 +915,20 @@ lws_http_digest_auth(struct lws* wsi)
 			goto bail;
 		}
 
+		/*
+		 * Keep track of digest auth to send it at next attempt, lws_client_reset will free it
+		*/
+
+		wsi->http.digest_auth_hdr = tmp_digest;
 		wsi->client_pipeline = 0;
 	}
 
 	return 0;
 
 bail:
-	lws_free(wsi->http.digest_auth_hdr);
-	wsi->http.digest_auth_hdr = NULL;
+	lws_free(tmp_digest);
 
-	return -1;
+	return LCBA_FAILED_AUTH;
 }
 #endif
 
@@ -1056,28 +1047,24 @@ lws_client_interpret_server_handshake(struct lws *wsi)
 #endif
 	n = atoi(p);
 
-#if defined(LWS_WITH_HTTP_DIGEST_AUTH)
-    if (n == 401 && lws_hdr_simple_ptr(wsi, WSI_TOKEN_HTTP_WWW_AUTHENTICATE)) {
-        if (!(wsi->stash && wsi->stash->cis[CIS_USERNAME] &&
-                wsi->stash->cis[CIS_PASSWORD])) {
-            lwsl_err(
-                "Digest auth requested by server but no credentials provided "
-                "by user\n");
-            return LCBA_FAILED_AUTH;
-        }
+#if defined(LWS_WITH_HTTP_DIGEST_AUTH) && defined(LWS_WITH_TLS)
+	if (n == 401 && lws_hdr_simple_ptr(wsi, WSI_TOKEN_HTTP_WWW_AUTHENTICATE)) {
+		if (!(wsi->stash && wsi->stash->cis[CIS_USERNAME] &&
+                		    wsi->stash->cis[CIS_PASSWORD])) {
+			lwsl_err("Digest auth requested by server but no credentials provided by user\n");
+			
+			return LCBA_FAILED_AUTH;
+		}
 
-        if (0 != lws_http_digest_auth(wsi)) {
-            if (wsi)
-                goto bail3;
-            return 1;
-        }
+		if (lws_http_digest_auth(wsi))
+			goto bail3;
 
 		opaque = wsi->a.opaque_user_data;
 		lws_close_free_wsi(wsi, LWS_CLOSE_STATUS_NOSTATUS, "digest_auth_step2");
 		wsi->a.opaque_user_data = opaque;
 
 		return -1;
-    }
+	}
 
     ah = wsi->http.ah;
 #endif
@@ -1654,6 +1641,8 @@ lws_generate_client_handshake(struct lws *wsi, char *pkt)
 	//	if (!wsi->client_pipeline)
 	//		conn1 = "close, ";
 		p = lws_generate_client_ws_handshake(wsi, p, conn1);
+                if (!p)
+                    return NULL;
 	} else
 #endif
 	{
@@ -1699,9 +1688,10 @@ lws_generate_client_handshake(struct lws *wsi, char *pkt)
 #if defined(LWS_WITH_HTTP_BASIC_AUTH)
 
 int
-lws_http_basic_auth_gen(const char *user, const char *pw, char *buf, size_t len)
+lws_http_basic_auth_gen2(const char *user, const void *pw, size_t pwd_len,
+			 char *buf, size_t len)
 {
-	size_t n = strlen(user), m = strlen(pw);
+	size_t n = strlen(user), m = pwd_len;
 	char b[128];
 
 	if (len < 6 + ((4 * (n + m + 1)) / 3) + 1)
@@ -1709,14 +1699,22 @@ lws_http_basic_auth_gen(const char *user, const char *pw, char *buf, size_t len)
 
 	memcpy(buf, "Basic ", 6);
 
-	n = (unsigned int)lws_snprintf(b, sizeof(b), "%s:%s", user, pw);
-	if (n >= sizeof(b) - 2)
+	n = (unsigned int)lws_snprintf(b, sizeof(b), "%s:", user);
+	if ((n + pwd_len) >= sizeof(b) - 2)
 		return 2;
+
+	memcpy(&b[n], pw, pwd_len);
+	n += pwd_len;
 
 	lws_b64_encode_string(b, (int)n, buf + 6, (int)len - 6);
 	buf[len - 1] = '\0';
 
 	return 0;
+}
+
+int lws_http_basic_auth_gen(const char *user, const char *pw, char *buf, size_t len)
+{
+	return lws_http_basic_auth_gen2(user, pw, strlen(pw), buf, len);
 }
 
 #endif

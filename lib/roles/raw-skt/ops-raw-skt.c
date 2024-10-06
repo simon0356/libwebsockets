@@ -60,12 +60,14 @@ lws_raw_skt_connect(struct lws *wsi)
 	}
 #endif
 
-	n = user_callback_handle_rxflow(wsi->a.protocol->callback,
-					wsi, wsi->role_ops->adoption_cb[lwsi_role_server(wsi)],
-					wsi->user_space, NULL, 0);
-	if (n) {
-		lws_inform_client_conn_fail(wsi, (void *)"user", 4);
-		return 1;
+	if (!wsi->hdr_parsing_completed) {
+		n = user_callback_handle_rxflow(wsi->a.protocol->callback,
+				wsi, wsi->role_ops->adoption_cb[lwsi_role_server(wsi)],
+				wsi->user_space, NULL, 0);
+		if (n) {
+			lws_inform_client_conn_fail(wsi, (void *)"user", 4);
+			return 1;
+		}
 	}
 
 	lws_set_timeout(wsi, NO_PENDING_TIMEOUT, 0);
@@ -172,7 +174,7 @@ rops_handle_POLLIN_raw_skt(struct lws_context_per_thread *pt, struct lws *wsi,
 #endif
 		default:
 			ebuf.token = NULL;
-			ebuf.len = 0;
+			ebuf.len = (int) wsi->a.protocol->rx_buffer_size;
 
 			buffered = lws_buflist_aware_read(pt, wsi, &ebuf, 1, __func__);
 			switch (ebuf.len) {

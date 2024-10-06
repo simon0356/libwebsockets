@@ -405,6 +405,8 @@ lws_upng_decode(lws_upng_t* u, const uint8_t **_pos, size_t *_size)
 			u->acc = (u->acc << 8) | *pos++;
 			if (++u->sctr == 4) {
 				u->width = u->acc;
+				if (!u->acc)
+					return LWS_SRET_FATAL + 18;
 				u->of++;
 				u->sctr = 0;
 			}
@@ -462,7 +464,7 @@ lws_upng_decode(lws_upng_t* u, const uint8_t **_pos, size_t *_size)
 			u->u.y		= 0;
 			u->u.ibp	= 0;
 			u->u.bypp	= (u->u.bpp + 7) / 8;
-			u->inf.bypl = u->u.bypl	= u->width * u->u.bypp;
+			u->inf.bypl	= u->u.bypl = u->width * u->u.bypp;
 
 			u->inf.outlen	= u->inf.info_size;
 			u->inf.outpos	= 0;
@@ -483,6 +485,12 @@ lws_upng_decode(lws_upng_t* u, const uint8_t **_pos, size_t *_size)
 		case UOF_CHUNK_LEN:
 			if (!u->inf.out) {
 				size_t ims = (u->u.bypl * 2) + u->inf.info_size;
+
+				if (u->u.bypl > UINT_MAX / 2 || u->inf.info_size > UINT_MAX - (u->u.bypl * 2)) {
+					lwsl_err("%s: integer overflow occur in ims %llu",
+						 __func__, (unsigned long long)ims);
+					return LWS_SRET_FATAL + 27;
+				}
 
 				if (u->hold_at_metadata)
 					return LWS_SRET_AWAIT_RETRY;

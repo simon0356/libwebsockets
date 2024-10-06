@@ -47,6 +47,7 @@ extern "C" {
 #if defined(_WIN32) && !defined(ETHER_ADDR_LEN)
 #define ETHER_ADDR_LEN 6
 #endif
+#define LWS_ETHER_ADDR_LEN ETHER_ADDR_LEN
 
 #include <stddef.h>
 #include <string.h>
@@ -101,8 +102,8 @@ typedef unsigned long long lws_intptr_t;
 #define O_RDONLY	_O_RDONLY
 #endif
 
-typedef int uid_t;
-typedef int gid_t;
+typedef unsigned int uid_t;
+typedef unsigned int gid_t;
 typedef unsigned short sa_family_t;
 #if !defined(LWS_HAVE_SUSECONDS_T)
 typedef unsigned int useconds_t;
@@ -141,7 +142,7 @@ typedef int suseconds_t;
 #define LWS_O_CREAT _O_CREAT
 #define LWS_O_TRUNC _O_TRUNC
 
-#ifndef __func__
+#if (__STDC_VERSION__ < 199901L) && !defined(__func__)
 #define __func__ __FUNCTION__
 #endif
 

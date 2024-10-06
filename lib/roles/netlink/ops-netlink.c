@@ -36,10 +36,6 @@
 #include <linux/netlink.h>
 #include <linux/rtnetlink.h>
 
-/* work around CentOS 7 -Wconversion problem */
-#undef RTA_ALIGNTO
-#define RTA_ALIGNTO 4U
-
 //#define lwsl_netlink lwsl_notice
 #define lwsl_cx_netlink		lwsl_cx_info
 #define lwsl_cx_netlink_debug	lwsl_cx_debug
@@ -602,7 +598,6 @@ rops_pt_init_destroy_netlink(struct lws_context *context,
 
 	memset(&sanl, 0, sizeof(sanl));
 	sanl.nl_family		= AF_NETLINK;
-	sanl.nl_pid		= (uint32_t)getpid();
 	sanl.nl_groups		= RTMGRP_LINK | RTMGRP_IPV4_ROUTE | RTMGRP_IPV4_IFADDR
 #if defined(LWS_WITH_IPV6)
 				  | RTMGRP_IPV6_ROUTE | RTMGRP_IPV6_IFADDR

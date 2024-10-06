@@ -94,6 +94,7 @@ lws_accept_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 	struct lws_context_per_thread *pt;
 	struct lws_pollfd eventfd;
 	struct lws *wsi;
+	int tsi = 0;
 
 	if (revents & EV_ERROR)
 		return;
@@ -112,10 +113,12 @@ lws_accept_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 	}
 
 	wsi = wsi_from_fd(context, watcher->fd);
-	pt = &context->pt[(int)wsi->tsi];
+	if (wsi)
+		tsi = (int)wsi->tsi;
+	pt = &context->pt[tsi];
 	ptpr = pt_to_priv_ev(pt);
 
-	lws_service_fd_tsi(context, &eventfd, (int)wsi->tsi);
+	lws_service_fd_tsi(context, &eventfd, tsi);
 
 	ev_idle_start(ptpr->io_loop, &ptpr->idle);
 }
@@ -136,6 +139,7 @@ lws_ev_sigint_cb(struct ev_loop *loop, struct ev_signal *watcher, int revents)
 static int
 elops_listen_init_ev(struct lws_dll2 *d, void *user)
 {
+#if defined(LWS_WITH_SERVER)
 	struct lws *wsi = lws_container_of(d, struct lws, listen_list);
 	struct lws_context *context = (struct lws_context *)user;
 	struct lws_context_per_thread *pt = &context->pt[(int)wsi->tsi];
@@ -150,6 +154,7 @@ elops_listen_init_ev(struct lws_dll2 *d, void *user)
 	ev_io_init(&vh_to_priv_ev(vh)->w_accept.watcher,
 		   lws_accept_cb, wsi->desc.sockfd, EV_READ);
 	ev_io_start(ptpr->io_loop, &vh_to_priv_ev(vh)->w_accept.watcher);
+#endif
 
 	return 0;
 }
@@ -240,6 +245,7 @@ elops_init_pt_ev(struct lws_context *context, void *_loop, int tsi)
 static int
 elops_listen_destroy_ev(struct lws_dll2 *d, void *user)
 {
+#if defined(LWS_WITH_SERVER)
 	struct lws *wsi = lws_container_of(d, struct lws, listen_list);
 	struct lws_context *context = (struct lws_context *)user;
 	struct lws_context_per_thread *pt = &context->pt[(int)wsi->tsi];
@@ -247,7 +253,7 @@ elops_listen_destroy_ev(struct lws_dll2 *d, void *user)
 	struct lws_vhost *vh = wsi->a.vhost;
 
 	ev_io_stop(ptpr->io_loop, &vh_to_priv_ev(vh)->w_accept.watcher);
-
+#endif
 	return 0;
 }
 
@@ -413,6 +419,14 @@ elops_destroy_wsi_ev(struct lws *wsi)
 	ev_io_stop(ptpr->io_loop, &w->w_write.watcher);
 }
 
+static int
+elops_wsi_logical_close_ev(struct lws *wsi)
+{
+        elops_destroy_wsi_ev(wsi);
+
+        return 0;
+}
+
 static const struct lws_event_loop_ops event_loop_ops_ev = {
 	/* name */			"libev",
 	/* init_context */		elops_init_context_ev,
@@ -420,7 +434,7 @@ static const struct lws_event_loop_ops event_loop_ops_ev = {
 	/* destroy_context2 */		elops_destroy_context2_ev,
 	/* init_vhost_listen_wsi */	elops_init_vhost_listen_wsi_ev,
 	/* init_pt */			elops_init_pt_ev,
-	/* wsi_logical_close */		NULL,
+	/* wsi_logical_close */		elops_wsi_logical_close_ev,
 	/* check_client_connect_ok */	NULL,
 	/* close_handle_manually */	NULL,
 	/* accept */			elops_accept_ev,
@@ -429,6 +443,7 @@ static const struct lws_event_loop_ops event_loop_ops_ev = {
 	/* destroy_pt */		elops_destroy_pt_ev,
 	/* destroy wsi */		elops_destroy_wsi_ev,
 	/* foreign_thread */		NULL,
+	/* fake_POLLIN */		NULL,
 
 	/* flags */			0,
 

@@ -337,8 +337,10 @@ endif()
 
 if (${CMAKE_SYSTEM_NAME} MATCHES "Linux")
 	option(LWS_WITH_NETLINK "Monitor Netlink for Routing Table changes" ON)
+	option(LWS_WITH_BINDTODEVICE "Use bind to interface socket option" ON)
 else()
 	set(LWS_WITH_NETLINK 0)
+	set(LWS_WITH_BINDTODEVICE 0)
 endif()
 option(LWS_WITH_MCUFONT_ENCODER "Build the ttf to mcufont encoder" OFF)
 
@@ -662,6 +664,8 @@ CHECK_C_SOURCE_COMPILES("#include <inttypes.h>\nvoid main(void) { while(1) ; } v
 CHECK_C_SOURCE_COMPILES("#include <sys/resource.h>\nvoid main(void) { while(1) ; } void xxexit(void){}" LWS_HAVE_SYS_RESOURCE_H)
 CHECK_C_SOURCE_COMPILES("#include <linux/ipv6.h>\nvoid main(void) { while(1) ; } void xxexit(void){}" LWS_HAVE_LINUX_IPV6_H)
 CHECK_C_SOURCE_COMPILES("#include <net/ethernet.h>\nvoid main(void) { while(1) ; } void xxexit(void){}" LWS_HAVE_NET_ETHERNET_H)
+CHECK_C_SOURCE_COMPILES("#include <systemd/sd-daemon.h>\nvoid main(void) { while(1) ; } void xxexit(void){}" LWS_HAVE_SYSTEMD_H)
+
 
 
 if (LWS_EXT_PTHREAD_INCLUDE_DIR)
@@ -1100,6 +1104,11 @@ add_custom_command(
 )
 
 add_custom_target(GENHDR DEPENDS  ${PROJECT_BINARY_DIR}/include/lws_config.h)
+if (CMAKE_VERSION VERSION_GREATER_EQUAL 3.15)
+    set_property(TARGET GENHDR APPEND PROPERTY ADDITIONAL_CLEAN_FILES
+	    "${PROJECT_BINARY_DIR}/include/libwebsockets")
+endif()
+
 
 file(GLOB HDR_PUBLIC1 RELATIVE ${CMAKE_CURRENT_SOURCE_DIR} include/libwebsockets/*.h)
 file(GLOB HDR_PUBLIC2 RELATIVE ${CMAKE_CURRENT_SOURCE_DIR} include/libwebsockets.h)

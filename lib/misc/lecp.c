@@ -673,10 +673,21 @@ push_m:
 		 * We're collecting int / float pieces
 		 */
 		case LECP_COLLECT:
-			if (ctx->be)
-				*ctx->collect_tgt++ = c;
-			else
-				*ctx->collect_tgt-- = c;
+			if (ctx->be) {
+
+				if (ctx->collect_tgt + 1 >= &ctx->item.opcode)
+					*ctx->collect_tgt = c;
+				else
+					*ctx->collect_tgt++ = c;
+
+			} else {
+
+				if (ctx->collect_tgt <= (uint8_t *)&ctx->item.u)
+					*ctx->collect_tgt = c;
+				else
+					*ctx->collect_tgt-- = c;
+
+			}
 
 			if (--st->collect_rem)
 				break;
@@ -985,7 +996,7 @@ format_scan(const char *fmt)
 		}
 
 		if (numeric) {
-			if (*fmt >= '0' && *fmt <= '9')
+			while (*fmt >= '0' && *fmt <= '9')
 				fmt++;
 			numeric = 0;
 			if (*fmt != '(')
@@ -1119,6 +1130,7 @@ pop:
 
 			return count[0];
 
+		case '-':
 		case '0':
 		case '1':
 		case '2':

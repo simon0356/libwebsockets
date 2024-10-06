@@ -893,6 +893,12 @@ lws_get_reserved_bits(struct lws *wsi)
 	return wsi->ws->rsv;
 }
 
+uint8_t
+lws_get_opcode(struct lws *wsi)
+{
+	return wsi->ws->opcode;
+}
+
 int
 lws_get_close_length(struct lws *wsi)
 {
@@ -943,7 +949,7 @@ rops_handle_POLLIN_ws(struct lws_context_per_thread *pt, struct lws *wsi,
 	unsigned int pending = 0;
 	struct lws_tokens ebuf;
 	char buffered = 0;
-	int n = 0, m, sanity = 10;
+	int n = 0, m, sanity = 100;
 #if defined(LWS_WITH_HTTP2)
 	struct lws *wsi1;
 #endif
